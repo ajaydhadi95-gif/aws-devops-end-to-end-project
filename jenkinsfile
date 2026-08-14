@@ -1,0 +1,10 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION = 'ap-south-1'
+        AWS ACCOUNT ID = CREDENTIALS['AWS_ACCOUNT_ID']
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        
+    }
+}

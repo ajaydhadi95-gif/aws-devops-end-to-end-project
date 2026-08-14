@@ -37,3 +37,27 @@ output "s3_bucket_arn" {
   description = "S3 Bucket ARN"
   value       = module.s3.bucket_arn
 }
+
+# ==================================================
+# Jenkins EC2 Outputs
+# ==================================================
+
+output "jenkins_instance_id" {
+  description = "Jenkins EC2 instance ID"
+  value       = module.jenkins_ec2.instance_id
+}
+
+output "jenkins_public_ip" {
+  description = "Jenkins EC2 public IP"
+  value       = module.jenkins_ec2.public_ip
+}
+
+output "jenkins_public_dns" {
+  description = "Jenkins EC2 public DNS"
+  value       = module.jenkins_ec2.public_dns
+}
+
+output "jenkins_private_ip" {
+  description = "Jenkins EC2 private IP"
+  value       = module.jenkins_ec2.private_ip
+}
