@@ -1,10 +1,238 @@
 pipeline {
+
     agent any
 
     environment {
-        AWS_REGION = 'ap-south-1'
-        AWS ACCOUNT ID = CREDENTIALS['AWS_ACCOUNT_ID']
-        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-        
+        AWS_REGION  = 'ap-south-1'
+        EKS_CLUSTER = 'devops-cluster'
+        NAMESPACE   = 'devops-app'
+
+        BACKEND_REPO  = 'backend'
+        FRONTEND_REPO = 'frontend'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                echo 'Checking out code from GitHub...'
+
+                git branch: 'main',
+                    url: 'https://github.com/ajaydhadi95-gif/aws-devops-end-to-end-project.git'
+            }
+        }
+
+        stage('Terraform') {
+            steps {
+                dir('terraform-aws') {
+                    sh '''
+                        terraform init
+                        terraform fmt -check
+                        terraform validate
+                        terraform plan -out=tfplan
+                    '''
+
+                    echo 'Applying Terraform infrastructure...'
+
+                    sh '''
+                        terraform apply -auto-approve tfplan
+                    '''
+                }
+            }
+        }
+
+        stage('Build Backend') {
+            steps {
+                dir('backend') {
+                    sh '''
+                        chmod +x mvnw || true
+
+                        if [ -f mvnw ]; then
+                            ./mvnw clean package -DskipTests
+                        else
+                            mvn clean package -DskipTests
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Build Frontend') {
+            steps {
+                dir('frontend') {
+                    sh '''
+                        npm install
+                        npm run build
+                    '''
+                }
+            }
+        }
+
+        stage('ECR Login') {
+            steps {
+                sh '''
+                    ACCOUNT_ID=$(aws sts get-caller-identity \
+                        --query Account \
+                        --output text)
+
+                    aws ecr get-login-password \
+                        --region ${AWS_REGION} | \
+                    docker login \
+                        --username AWS \
+                        --password-stdin \
+                        ${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                '''
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                sh '''
+                    docker build \
+                        -t ${BACKEND_REPO}:${BUILD_NUMBER} \
+                        ./backend
+
+                    docker build \
+                        -t ${FRONTEND_REPO}:${BUILD_NUMBER} \
+                        ./frontend
+                '''
+            }
+        }
+
+        stage('Push Images to ECR') {
+            steps {
+                sh '''
+                    ACCOUNT_ID=$(aws sts get-caller-identity \
+                        --query Account \
+                        --output text)
+
+                    ECR=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+                    docker tag \
+                        ${BACKEND_REPO}:${BUILD_NUMBER} \
+                        ${ECR}/${BACKEND_REPO}:${BUILD_NUMBER}
+
+                    docker tag \
+                        ${FRONTEND_REPO}:${BUILD_NUMBER} \
+                        ${ECR}/${FRONTEND_REPO}:${BUILD_NUMBER}
+
+                    docker push \
+                        ${ECR}/${BACKEND_REPO}:${BUILD_NUMBER}
+
+                    docker push \
+                        ${ECR}/${FRONTEND_REPO}:${BUILD_NUMBER}
+                '''
+            }
+        }
+
+        stage('Configure EKS') {
+            steps {
+                sh '''
+                    aws eks update-kubeconfig \
+                        --region ${AWS_REGION} \
+                        --name ${EKS_CLUSTER}
+
+                    kubectl get nodes
+                '''
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh '''
+                    kubectl apply \
+                        -f k8s/ \
+                        -n ${NAMESPACE}
+
+                    ACCOUNT_ID=$(aws sts get-caller-identity \
+                        --query Account \
+                        --output text)
+
+                    ECR=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+                    kubectl set image \
+                        deployment/backend \
+                        backend=${ECR}/${BACKEND_REPO}:${BUILD_NUMBER} \
+                        -n ${NAMESPACE}
+
+                    kubectl set image \
+                        deployment/frontend \
+                        frontend=${ECR}/${FRONTEND_REPO}:${BUILD_NUMBER} \
+                        -n ${NAMESPACE}
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    echo "Checking Pods..."
+                    kubectl get pods -n ${NAMESPACE}
+
+                    echo "Checking Services..."
+                    kubectl get svc -n ${NAMESPACE}
+
+                    echo "Backend Rollout..."
+                    kubectl rollout status \
+                        deployment/backend \
+                        -n ${NAMESPACE} \
+                        --timeout=300s
+
+                    echo "Frontend Rollout..."
+                    kubectl rollout status \
+                        deployment/frontend \
+                        -n ${NAMESPACE} \
+                        --timeout=300s
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo '''
+            ========================================
+              DEPLOYMENT SUCCESSFUL
+            ========================================
+            '''
+
+            sh '''
+                echo "EKS Cluster: ${EKS_CLUSTER}"
+                echo "Namespace: ${NAMESPACE}"
+
+                kubectl get pods -n ${NAMESPACE}
+                kubectl get svc -n ${NAMESPACE}
+
+                docker image prune -f || true
+            '''
+
+            cleanWs()
+        }
+
+        failure {
+            echo '''
+            ========================================
+                DEPLOYMENT FAILED
+            ========================================
+            '''
+
+            sh '''
+                kubectl get pods -n ${NAMESPACE} || true
+                kubectl get svc -n ${NAMESPACE} || true
+            '''
+
+            cleanWs()
+        }
+
+        always {
+            echo 'Pipeline execution completed.'
+        }
     }
 }
