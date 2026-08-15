@@ -29,31 +29,6 @@ pipeline {
             }
         }
 
-        stage('Terraform') {
-            steps {
-                dir('terraform-aws') {
-                    sh '''
-                        echo "Initializing Terraform..."
-
-                        terraform init
-
-                        echo "Validating Terraform..."
-
-                        terraform fmt -check
-                        terraform validate
-
-                        echo "Creating Terraform plan..."
-
-                        terraform plan -out=tfplan
-
-                        echo "Applying Terraform..."
-
-                        terraform apply -auto-approve tfplan
-                    '''
-                }
-            }
-        }
-
         stage('Build Backend') {
             steps {
                 echo 'Building backend Docker image...'
