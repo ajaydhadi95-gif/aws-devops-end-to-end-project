@@ -1,3 +1,4 @@
+```groovy
 pipeline {
 
     agent any
@@ -32,15 +33,21 @@ pipeline {
             steps {
                 dir('terraform-aws') {
                     sh '''
+                        echo "Initializing Terraform..."
+
                         terraform init
+
+                        echo "Validating Terraform..."
+
                         terraform fmt -check
                         terraform validate
+
+                        echo "Creating Terraform plan..."
+
                         terraform plan -out=tfplan
-                    '''
 
-                    echo 'Applying Terraform infrastructure...'
+                        echo "Applying Terraform..."
 
-                    sh '''
                         terraform apply -auto-approve tfplan
                     '''
                 }
@@ -49,28 +56,25 @@ pipeline {
 
         stage('Build Backend') {
             steps {
-                dir('backend') {
-                    sh '''
-                        chmod +x mvnw || true
+                echo 'Building backend Docker image...'
 
-                        if [ -f mvnw ]; then
-                            ./mvnw clean package -DskipTests
-                        else
-                            mvn clean package -DskipTests
-                        fi
-                    '''
-                }
+                sh '''
+                    docker build \
+                        -t ${BACKEND_REPO}:${BUILD_NUMBER} \
+                        ./backend
+                '''
             }
         }
 
         stage('Build Frontend') {
             steps {
-                dir('frontend') {
-                    sh '''
-                        npm install
-                        npm run build
-                    '''
-                }
+                echo 'Building frontend Docker image...'
+
+                sh '''
+                    docker build \
+                        -t ${FRONTEND_REPO}:${BUILD_NUMBER} \
+                        ./cicd-deployment
+                '''
             }
         }
 
@@ -80,6 +84,8 @@ pipeline {
                     ACCOUNT_ID=$(aws sts get-caller-identity \
                         --query Account \
                         --output text)
+
+                    echo "AWS Account: ${ACCOUNT_ID}"
 
                     aws ecr get-login-password \
                         --region ${AWS_REGION} | \
@@ -91,16 +97,22 @@ pipeline {
             }
         }
 
-        stage('Build Docker Images') {
+        stage('Create ECR Repositories') {
             steps {
                 sh '''
-                    docker build \
-                        -t ${BACKEND_REPO}:${BUILD_NUMBER} \
-                        ./backend
+                    aws ecr describe-repositories \
+                        --repository-names ${BACKEND_REPO} \
+                        --region ${AWS_REGION} \
+                    || aws ecr create-repository \
+                        --repository-name ${BACKEND_REPO} \
+                        --region ${AWS_REGION}
 
-                    docker build \
-                        -t ${FRONTEND_REPO}:${BUILD_NUMBER} \
-                        ./frontend
+                    aws ecr describe-repositories \
+                        --repository-names ${FRONTEND_REPO} \
+                        --region ${AWS_REGION} \
+                    || aws ecr create-repository \
+                        --repository-name ${FRONTEND_REPO} \
+                        --region ${AWS_REGION}
                 '''
             }
         }
@@ -112,21 +124,29 @@ pipeline {
                         --query Account \
                         --output text)
 
-                    ECR=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                    echo "Tagging backend image..."
 
                     docker tag \
                         ${BACKEND_REPO}:${BUILD_NUMBER} \
-                        ${ECR}/${BACKEND_REPO}:${BUILD_NUMBER}
+                        ${ECR_REGISTRY}/${BACKEND_REPO}:${BUILD_NUMBER}
+
+                    echo "Tagging frontend image..."
 
                     docker tag \
                         ${FRONTEND_REPO}:${BUILD_NUMBER} \
-                        ${ECR}/${FRONTEND_REPO}:${BUILD_NUMBER}
+                        ${ECR_REGISTRY}/${FRONTEND_REPO}:${BUILD_NUMBER}
+
+                    echo "Pushing backend image..."
 
                     docker push \
-                        ${ECR}/${BACKEND_REPO}:${BUILD_NUMBER}
+                        ${ECR_REGISTRY}/${BACKEND_REPO}:${BUILD_NUMBER}
+
+                    echo "Pushing frontend image..."
 
                     docker push \
-                        ${ECR}/${FRONTEND_REPO}:${BUILD_NUMBER}
+                        ${ECR_REGISTRY}/${FRONTEND_REPO}:${BUILD_NUMBER}
                 '''
             }
         }
@@ -134,36 +154,52 @@ pipeline {
         stage('Configure EKS') {
             steps {
                 sh '''
+                    echo "Connecting kubectl to EKS..."
+
                     aws eks update-kubeconfig \
                         --region ${AWS_REGION} \
                         --name ${EKS_CLUSTER}
+
+                    echo "Checking EKS nodes..."
 
                     kubectl get nodes
                 '''
             }
         }
 
-        stage('Deploy to Kubernetes') {
+        stage('Deploy Kubernetes') {
             steps {
                 sh '''
+                    echo "Creating/updating Kubernetes resources..."
+
                     kubectl apply \
                         -f k8s/ \
                         -n ${NAMESPACE}
+                '''
+            }
+        }
 
+        stage('Update Images') {
+            steps {
+                sh '''
                     ACCOUNT_ID=$(aws sts get-caller-identity \
                         --query Account \
                         --output text)
 
-                    ECR=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+                    ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                    echo "Updating backend image..."
 
                     kubectl set image \
                         deployment/backend \
-                        backend=${ECR}/${BACKEND_REPO}:${BUILD_NUMBER} \
+                        backend=${ECR_REGISTRY}/${BACKEND_REPO}:${BUILD_NUMBER} \
                         -n ${NAMESPACE}
+
+                    echo "Updating frontend image..."
 
                     kubectl set image \
                         deployment/frontend \
-                        frontend=${ECR}/${FRONTEND_REPO}:${BUILD_NUMBER} \
+                        frontend=${ECR_REGISTRY}/${FRONTEND_REPO}:${BUILD_NUMBER} \
                         -n ${NAMESPACE}
                 '''
             }
@@ -172,23 +208,32 @@ pipeline {
         stage('Verify Deployment') {
             steps {
                 sh '''
-                    echo "Checking Pods..."
-                    kubectl get pods -n ${NAMESPACE}
+                    echo "Checking Kubernetes pods..."
 
-                    echo "Checking Services..."
-                    kubectl get svc -n ${NAMESPACE}
+                    kubectl get pods \
+                        -n ${NAMESPACE} \
+                        -o wide
 
-                    echo "Backend Rollout..."
+                    echo "Checking Kubernetes services..."
+
+                    kubectl get svc \
+                        -n ${NAMESPACE}
+
+                    echo "Checking backend rollout..."
+
                     kubectl rollout status \
                         deployment/backend \
                         -n ${NAMESPACE} \
                         --timeout=300s
 
-                    echo "Frontend Rollout..."
+                    echo "Checking frontend rollout..."
+
                     kubectl rollout status \
                         deployment/frontend \
                         -n ${NAMESPACE} \
                         --timeout=300s
+
+                    echo "Deployment verification completed."
                 '''
             }
         }
@@ -198,17 +243,25 @@ pipeline {
 
         success {
             echo '''
-            ========================================
-              DEPLOYMENT SUCCESSFUL
-            ========================================
+            ==========================================
+                  DEPLOYMENT SUCCESSFUL
+            ==========================================
             '''
 
             sh '''
-                echo "EKS Cluster: ${EKS_CLUSTER}"
-                echo "Namespace: ${NAMESPACE}"
+                echo "Cluster:"
+                echo "${EKS_CLUSTER}"
 
-                kubectl get pods -n ${NAMESPACE}
-                kubectl get svc -n ${NAMESPACE}
+                echo "Namespace:"
+                echo "${NAMESPACE}"
+
+                echo "Pods:"
+                kubectl get pods -n ${NAMESPACE} || true
+
+                echo "Services:"
+                kubectl get svc -n ${NAMESPACE} || true
+
+                echo "Cleaning unused Docker images..."
 
                 docker image prune -f || true
             '''
@@ -218,21 +271,33 @@ pipeline {
 
         failure {
             echo '''
-            ========================================
-                DEPLOYMENT FAILED
-            ========================================
+            ==========================================
+                    DEPLOYMENT FAILED
+            ==========================================
             '''
 
             sh '''
-                kubectl get pods -n ${NAMESPACE} || true
-                kubectl get svc -n ${NAMESPACE} || true
+                echo "Collecting Kubernetes information..."
+
+                kubectl get pods \
+                    -n ${NAMESPACE} \
+                    -o wide || true
+
+                kubectl get svc \
+                    -n ${NAMESPACE} || true
+
+                kubectl get events \
+                    -n ${NAMESPACE} \
+                    --sort-by=.lastTimestamp \
+                    | tail -50 || true
             '''
 
             cleanWs()
         }
 
         always {
-            echo 'Pipeline execution completed.'
+            echo 'Jenkins pipeline execution completed.'
         }
     }
 }
+```
